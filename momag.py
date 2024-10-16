@@ -1,9 +1,12 @@
+from torchvision.io import write_jpeg
+from torchvision.utils import flow_to_image
 import os
 import numpy as np
 from PIL import Image
 import cProfile
 import pstats
 import io
+import subprocess
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import torch
@@ -30,6 +33,14 @@ def show_mask(mask, ax, obj_id=None, random_color=False):
     mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
     ax.imshow(mask_image)
 
+    # frame_stride = 30
+    # for frame_id in range(0, 100, frame_stride):
+    #     plt.figure(figsize=(6, 4))
+    #     plt.title(f"frame {frame_id}")
+    #     for out_obj_id, out_mask in video_segments[frame_id].items():
+    #         show_mask(out_mask, plt.gca(), obj_id=out_obj_id)
+    #     plt.savefig(f"out_{frame_id}.png")
+
 
 def show_points(coords, labels, ax, marker_size=200):
     pos_points = coords[labels == 1]
@@ -54,8 +65,23 @@ def show_points(coords, labels, ax, marker_size=200):
     )
 
 
-def make_video_dir(video_file):
-    os.cmd(f"ffmpeg -i {video_file} -q:v 2 -start_number 0 <output_dir>/'%05d.jpg'")
+def make_video_dir(video_file, name):
+    print("Spliting frames into jpegs")
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-i",
+            video_file,
+            "-q:v",
+            "2",
+            "-start_number",
+            "0",
+            f"{name}/%05d.jpg",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    print("finished spliting frames: ", result.stdout)
 
 
 # ffmpeg -i <your_video>.mp4 -q:v 2 -start_number 0 <output_dir>/'%05d.jpg'
@@ -113,6 +139,9 @@ def get_flows(frames, raft):
     all_flows = []
     num_frames = len(frames)
 
+    # ffmpeg -f image2 -framerate 30 -i predicted_flow_%d.jpg -loop -1 flow.gif
+    image_idx = 0
+
     for idx in tqdm(
         range(0, num_frames - 1, chunk_size), desc="Getting flows from frames"
     ):
@@ -125,9 +154,13 @@ def get_flows(frames, raft):
         img1_batch, img2_batch = preprocess(img1_batch, img2_batch)
 
         with torch.no_grad():
-            flow = raft(img1_batch.to("cuda"), img2_batch.to("cuda"))[-1]
+            flow = raft(img1_batch.to("cuda"), img2_batch.to("cuda"))[-1].cpu()
 
-        flow = flow.cpu()
+        flow_imgs = flow_to_image(flow)
+        # flow = flow.cpu()
+        for imgs in flow_imgs:
+            image_idx += 1
+            write_jpeg(imgs, f"./out/flow/predicted_flow_{image_idx}.jpg")
 
         all_flows.append(flow)
 
@@ -202,7 +235,7 @@ def magnify_motion(frames, flows, video_segments, id, mag_ratio=40):
             frame,
             new_grid,
             mode="bicubic",
-            padding_mode="zeros",
+            padding_mode="border",
             align_corners=True,
         )
 
@@ -212,15 +245,15 @@ def magnify_motion(frames, flows, video_segments, id, mag_ratio=40):
         warped_mask = NF.grid_sample(
             mask,
             new_grid,
-            mode="bicubic",
+            mode="nearest",
             padding_mode="zeros",
             align_corners=True,
         )
 
         warped_mask = (warped_mask >= 0.5).float()
         # if k == 1:
-        #     frames_out[k] = inpaint_texture(
-        #         frames_out[k] * (1 - warped_mask) * (1 - mask)
+        #     frames[k] = inpaint_texture(
+        #         frames[k] * (1 - warped_mask) * (1 - mask)
         #     )
         # else:
         frames_out[k] = warped_frame * warped_mask + frames_out[k] * (1 - warped_mask)
@@ -228,7 +261,36 @@ def magnify_motion(frames, flows, video_segments, id, mag_ratio=40):
     return frames_out
 
 
+def resize_video(frames, h, w):
+    resize_transform = T.Resize((h, w))
+    resized_frames = []
+    for frame in frames:
+        frame = resize_transform(frame)
+        resized_frames.append(frame)
+
+    frames = torch.stack(resized_frames)
+    return frames
+
+
 if __name__ == "__main__":
+    ################ PROFILING ##################
+    # pr = cProfile.Profile()
+    # pr.enable()
+    ################ PROFILING ##################
+
+    INPUT_DIR = "./in/"
+    INPUT_FILE = "swing.mp4"
+    obj_id_map = {}
+    obj_id_map[1] = ([[200, 210], [250, 400]], [1, 1])
+    magnification_rate = 400
+
+    name, ext = os.path.splitext(INPUT_FILE)
+    output_file = f"{name}-magnified.mp4"
+    video_dir = INPUT_DIR + name
+
+    if not os.path.isdir(video_dir):
+        make_video_dir(INPUT_DIR + INPUT_FILE, video_dir)
+
     if torch.cuda.is_available():
         device = torch.device("cuda")
     else:
@@ -241,71 +303,48 @@ if __name__ == "__main__":
             torch.backends.cudnn.allow_tf32 = True
     print(f"using device: {device}")
 
-    pr = cProfile.Profile()
-    pr.enable()
-
-    INPUT_DIR = "./in/"
-    INPUT_FILE = "input.mp4"
-    H, W = 960, 520
-    output_file = "magnified.mp4"
-
     raft = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(device)
     raft = raft.eval()
     predictor = SAM2VideoPredictor.from_pretrained("facebook/sam2-hiera-large")
 
     frames, _, _ = read_video(INPUT_DIR + INPUT_FILE, output_format="TCHW")
-
-    resize_transform = T.Resize((H, W))
-    resized_frames = []
-    for frame in frames:
-        frame = resize_transform(frame)
-        resized_frames.append(frame)
-
-    frames = torch.stack(resized_frames)
+    _, _, h, w = frames.shape
+    H = h // 8 * 8
+    W = w // 8 * 8
+    # H = 960
+    # W = 520
+    frames = resize_video(frames, H, W)
+    print(f"resized from {h, w} to {H, W}")
 
     stable_video = stablize_video(frames, INPUT_FILE)
 
-    name, ext = os.path.splitext(INPUT_FILE)
-
     frames_stable, _, _ = read_video(stable_video, output_format="TCHW")
-    resized_frames = []
-    for frame in frames_stable:
-        frame = resize_transform(frame)
-        resized_frames.append(frame)
-    frames_stable = torch.stack(resized_frames)
+    frames_stable = resize_video(frames_stable, H, W)
 
     print("stable_video shape is ", frames_stable.shape)
 
-    obj_id_map = {}
-    obj_id_map[1] = ([[200, 210], [250, 400]], [1, 1])
-
-    video_dir = "./in/bottle"
     inference_state = add_initial_masks(video_dir, predictor, obj_id_map)
     video_segments = propagate_masks(predictor, inference_state)
 
-    # frame_stride = 30
-    # for frame_id in range(0, 100, frame_stride):
-    #     plt.figure(figsize=(6, 4))
-    #     plt.title(f"frame {frame_id}")
-    #     for out_obj_id, out_mask in video_segments[frame_id].items():
-    #         show_mask(out_mask, plt.gca(), obj_id=out_obj_id)
-    #     plt.savefig(f"out_{frame_id}.png")
-
-    print("ready to magnify")
     flows = get_flows(frames_stable, raft)
     print("flows shape is ", flows.shape)
     # print("flows is ", flows)
+    print("Magnifying")
     frames_mag = magnify_motion(
-        frames_stable, flows, video_segments, 1
+        frames_stable, flows, video_segments, 1, magnification_rate
     )  # magnifies obj 1
+    print("Finished magnifying")
 
     frames_mag = frames_mag.permute(0, 2, 3, 1)  # [T, H, W, C]
 
     write_video(output_file, frames_mag, fps=30)
+    print(f"Wrote {output_file} with shape {frames_mag.shape}")
 
-    pr.disable()
-    s = io.StringIO()
-    sortby = pstats.SortKey.TIME
-    ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
-    ps.print_stats()
-    print("\n".join(s.getvalue().splitlines()[:10]))
+    ################ PROFILING ##################
+    # pr.disable()
+    # s = io.StringIO()
+    # sortby = pstats.SortKey.TIME
+    # ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
+    # ps.print_stats()
+    # print("\n".join(s.getvalue().splitlines()[:10]))
+    ################ PROFILING ##################

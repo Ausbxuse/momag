@@ -130,7 +130,7 @@ def calc_stable_prob(k, trajectories):
     sigma_k = np.mean(norm_sq)
     pr_k = np.exp(
         -norm_sq / (2 * sigma_k**2)
-    )  # calculates for all n feaaaatuers. shape (n)
+    )  # calculates for all n features. shape (n)
 
     return pr_k
 
@@ -167,7 +167,7 @@ def equalize_histogram(frame_k, frame_ref):
     return frame
 
 
-def stablize_video(frames, filename, flows=None):  # frames are pytorch tensors,
+def stablize_video(frames, filename, flows=None):  # frames are pytorch tensors
     n_frames = len(frames)
     name, ext = os.path.splitext(filename)
     out_file = "./out/{name}_stable{ext}".format(name=name, ext=ext)
